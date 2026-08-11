@@ -1,0 +1,10 @@
+[package]
+name = "browserprofile"
+version = "0.1.0"
+edition = "2021"
+description = "Safe runtime management for Firefox-family profiles"
+license = "MIT"
+
+[[bin]]
+name = "bp"
+path = "src/main.rs"
