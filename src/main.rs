@@ -642,6 +642,39 @@ fn set_default_locked(browser: Browser, name: &str) -> io::Result<()> {
     }
     atomic_write(&ini, (out.join("\n") + "\n").as_bytes())
 }
+fn register_profile_locked(browser: Browser, name: &str) -> io::Result<()> {
+    let ini = ini_path(browser);
+    let text = fs::read_to_string(&ini).unwrap_or_default();
+    let parsed = profiles(&text);
+    if parsed.iter().any(|p| p.name.as_deref() == Some(name)) {
+        return Ok(());
+    }
+    let target_path = profile_dir(browser, name).to_string_lossy().into_owned();
+    let next = parsed
+        .iter()
+        .filter_map(|p| {
+            p.section
+                .strip_prefix("Profile")
+                .and_then(|n| n.parse::<usize>().ok())
+        })
+        .max()
+        .map_or(0, |n| n + 1);
+    let mut out = text.lines().map(str::to_owned).collect::<Vec<_>>();
+    out.extend([
+        String::new(),
+        format!("[Profile{next}]"),
+        format!("Name={name}"),
+        "IsRelative=0".into(),
+        format!("Path={target_path}"),
+        "Default=0".into(),
+    ]);
+    if let Some(parent) = ini.parent() {
+        reject_symlink_ancestors(parent)?;
+        fs::create_dir_all(parent)?;
+    }
+    atomic_write(&ini, (out.join("\n") + "\n").as_bytes())
+}
+
 fn create(browser: Browser, name: &str, make_default: bool) -> io::Result<()> {
     let _lock = MutationLock::acquire(browser)?;
     create_locked(browser, name, make_default)
@@ -676,6 +709,8 @@ fn create_locked(browser: Browser, name: &str, make_default: bool) -> io::Result
             .open(dir.join(MARKER))?;
         if make_default {
             set_default_locked(browser, name)?;
+        } else {
+            register_profile_locked(browser, name)?;
         }
         Ok(())
     })();
