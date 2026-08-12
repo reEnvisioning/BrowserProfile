@@ -13,7 +13,8 @@ bp remove work --browser firefox --yes
 
 Profiles created by `bp` live under `$XDG_DATA_HOME/browserprofile/` (or
 `~/.local/share/browserprofile`). Browser `profiles.ini` files are read from
-`$XDG_CONFIG_HOME` (or `~/.config`). Names are deliberately restricted to
+Firefox's `mozilla/firefox` config path and LibreWolf's nested
+`librewolf/librewolf` config path. Names are deliberately restricted to
 letters, digits, `_`, `-`, and `.` and cannot begin with `.`.
 
 `remove` only deletes profiles carrying `.browserprofile-owned`. `apply` and

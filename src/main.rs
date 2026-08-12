@@ -25,12 +25,6 @@ impl Browser {
             Self::Librewolf => "librewolf",
         }
     }
-    fn config_dir(self) -> &'static str {
-        match self {
-            Self::Firefox => "mozilla/firefox",
-            Self::Librewolf => "librewolf",
-        }
-    }
     fn executable(self) -> &'static str {
         self.as_str()
     }
@@ -53,18 +47,22 @@ fn profile_dir(browser: Browser, name: &str) -> PathBuf {
     data_root().join(browser.as_str()).join(name)
 }
 fn ini_path(browser: Browser) -> PathBuf {
-    let xdg_path = config_root()
-        .join(browser.config_dir())
-        .join("profiles.ini");
-    if browser == Browser::Librewolf && !xdg_path.exists() {
-        if let Some(home) = env::var_os("HOME") {
-            let legacy = PathBuf::from(home).join(".librewolf/profiles.ini");
-            if legacy.exists() {
-                return legacy;
+    match browser {
+        Browser::Firefox => config_root().join("mozilla/firefox/profiles.ini"),
+        Browser::Librewolf => {
+            let nested = config_root().join("librewolf/librewolf/profiles.ini");
+            if nested.exists() {
+                return nested;
             }
+            if let Some(home) = env::var_os("HOME") {
+                let legacy = PathBuf::from(home).join(".librewolf/profiles.ini");
+                if legacy.exists() {
+                    return legacy;
+                }
+            }
+            nested
         }
     }
-    xdg_path
 }
 fn reject_symlink_ancestors(path: &Path) -> io::Result<()> {
     let mut current = Some(path);
