@@ -800,27 +800,6 @@ fn remove_locked(browser: Browser, name: &str, yes: bool) -> io::Result<()> {
             "profile is not browserprofile-owned",
         ));
     }
-    let ini = ini_path(browser);
-    if ini.exists() {
-        let text = fs::read_to_string(&ini)?;
-        if install_default_paths(&ini, &text)?
-            .iter()
-            .any(|install_dir| same_path(install_dir, &dir))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "refusing to remove an install default profile",
-            ));
-        }
-    }
-    if let Some((_, default_dir)) = default_profile(browser)? {
-        if same_path(&default_dir, &dir) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "refusing to remove the browser default profile",
-            ));
-        }
-    }
     if dir.join("user.js").is_symlink() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -833,8 +812,15 @@ fn remove_locked(browser: Browser, name: &str, yes: bool) -> io::Result<()> {
             "refusing symlinked ownership marker",
         ));
     }
-    if !yes {
-        print!("Remove {name}? [y/N] ");
+    let is_default = default_profile(browser)?
+        .map(|(_, default_dir)| same_path(&default_dir, &dir))
+        .unwrap_or(false);
+    if is_default || !yes {
+        if is_default {
+            print!("Remove browser default profile {name}? [y|N] ");
+        } else {
+            print!("Remove {name}? [y/N] ");
+        }
         io::stdout().flush()?;
         let mut answer = String::new();
         io::stdin().read_line(&mut answer)?;

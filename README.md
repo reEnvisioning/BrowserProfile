@@ -24,6 +24,7 @@ and `.` and cannot begin with `.`.
 does not prove that LibreWolf's persistent profile menu registry contains the
 profile.
 
-`remove` only deletes profiles carrying `.browserprofile-owned`. `apply` and
-`remove` refuse symlinked profile directories and `user.js` files. Launching
-uses `std::process::Command`, never a shell.
+`remove` only deletes profiles carrying `.browserprofile-owned`. Removing a
+browser-default profile always asks `Remove browser default profile NAME? [y|N]`,
+even with `--yes`. `apply` and `remove` refuse symlinked profile directories and
+`user.js` files. Launching uses `std::process::Command`, never a shell.
