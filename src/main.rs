@@ -49,19 +49,9 @@ fn profile_dir(browser: Browser, name: &str) -> PathBuf {
 fn ini_path(browser: Browser) -> PathBuf {
     match browser {
         Browser::Firefox => config_root().join("mozilla/firefox/profiles.ini"),
-        Browser::Librewolf => {
-            let nested = config_root().join("librewolf/librewolf/profiles.ini");
-            if nested.exists() {
-                return nested;
-            }
-            if let Some(home) = env::var_os("HOME") {
-                let legacy = PathBuf::from(home).join(".librewolf/profiles.ini");
-                if legacy.exists() {
-                    return legacy;
-                }
-            }
-            nested
-        }
+        Browser::Librewolf => env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(".librewolf/profiles.ini"))
+            .unwrap_or_else(|| PathBuf::from(".librewolf/profiles.ini")),
     }
 }
 fn reject_symlink_ancestors(path: &Path) -> io::Result<()> {
@@ -305,13 +295,12 @@ fn profiles(ini: &str) -> Vec<IniProfile> {
     }
     out
 }
-fn profiles_from_ini(browser: Browser) -> io::Result<Vec<(String, PathBuf)>> {
-    let ini = ini_path(browser);
-    reject_symlink_ancestors(&ini)?;
+fn profiles_from_ini_at(ini: &Path) -> io::Result<Vec<(String, PathBuf)>> {
+    reject_symlink_ancestors(ini)?;
     if !ini.exists() {
         return Ok(Vec::new());
     }
-    let text = fs::read_to_string(&ini)?;
+    let text = fs::read_to_string(ini)?;
     let mut out = Vec::new();
     for p in profiles(&text) {
         if !p.fields_valid || !p.relative_present || !p.relative_valid {
@@ -323,7 +312,7 @@ fn profiles_from_ini(browser: Browser) -> io::Result<Vec<(String, PathBuf)>> {
         let Some(raw_path) = p.path.as_deref() else {
             continue;
         };
-        let path = resolve_ini_path(&ini, raw_path, p.relative)?;
+        let path = resolve_ini_path(ini, raw_path, p.relative)?;
         let Some(name) = p
             .name
             .or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -339,6 +328,53 @@ fn profiles_from_ini(browser: Browser) -> io::Result<Vec<(String, PathBuf)>> {
         out.push((name, path));
     }
     Ok(out)
+}
+fn profiles_from_ini(browser: Browser) -> io::Result<Vec<(String, PathBuf)>> {
+    profiles_from_ini_at(&ini_path(browser))
+}
+fn reconcile_librewolf() -> io::Result<()> {
+    let obsolete = config_root().join("librewolf/librewolf/profiles.ini");
+    if !obsolete.exists() {
+        return Ok(());
+    }
+    let _lock = MutationLock::acquire(Browser::Librewolf)?;
+    let candidates = profiles_from_ini_at(&obsolete)?
+        .into_iter()
+        .filter(|(name, path)| {
+            valid_name(name)
+                && path == &profile_dir(Browser::Librewolf, name)
+                && safe_dir(path).is_ok()
+                && owned_marker(path)
+        })
+        .collect::<Vec<_>>();
+    let known = profiles_from_ini(Browser::Librewolf)?;
+    for (name, path) in &candidates {
+        for (known_name, known_path) in &known {
+            if (name == known_name && !same_path(path, known_path))
+                || (same_path(path, known_path) && name != known_name)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "LibreWolf profile registry collision",
+                ));
+            }
+        }
+    }
+    for (index, (name, path)) in candidates.iter().enumerate() {
+        if candidates[..index]
+            .iter()
+            .any(|(known_name, known_path)| name == known_name || same_path(path, known_path))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "LibreWolf profile registry collision",
+            ));
+        }
+    }
+    for (name, _) in candidates {
+        register_profile_locked(Browser::Librewolf, &name)?;
+    }
+    Ok(())
 }
 fn default_profile(browser: Browser) -> io::Result<Option<(String, PathBuf)>> {
     let path = ini_path(browser);
@@ -644,7 +680,11 @@ fn set_default_locked(browser: Browser, name: &str) -> io::Result<()> {
 }
 fn register_profile_locked(browser: Browser, name: &str) -> io::Result<()> {
     let ini = ini_path(browser);
-    let text = fs::read_to_string(&ini).unwrap_or_default();
+    let text = match fs::read_to_string(&ini) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
     let parsed = profiles(&text);
     if parsed.iter().any(|p| p.name.as_deref() == Some(name)) {
         return Ok(());
@@ -999,6 +1039,9 @@ fn main() -> io::Result<()> {
     validate_cli(&command, &a)?;
     let before_separator = a.iter().position(|x| x == "--").unwrap_or(a.len());
     let browser = option(&a[..before_separator], "--browser", Browser::Firefox)?;
+    if browser == Browser::Librewolf {
+        reconcile_librewolf()?;
+    }
     let positional = positional_args(&a);
     match command.as_str() {
         "list" => list(browser, a.iter().any(|x| x == "--all")),
