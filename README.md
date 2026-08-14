@@ -1,11 +1,12 @@
 # BrowserProfile
 
-`bp` is a small standalone CLI for safe runtime Firefox and LibreWolf profile management.
+`bp` is a small standalone CLI for safe runtime Firefox and LibreWolf profile management. The Nix package also installs `browserprofile` as a symlink to `bp`.
 
 ```sh
 bp create work --browser firefox --default
 bp apply default --browser firefox --backup
-bp list --browser firefox
+bp list                         # Firefox and LibreWolf, browser-qualified
+bp list --browser firefox       # Firefox only
 bp default get --browser firefox
 bp launch work --browser firefox -- https://example.org
 bp remove work --browser firefox --yes
@@ -24,7 +25,15 @@ and `.` and cannot begin with `.`.
 does not prove that LibreWolf's persistent profile menu registry contains the
 profile.
 
-`remove` only deletes profiles carrying `.browserprofile-owned`. Removing a
-browser-default profile always asks `Remove browser default profile NAME? [y|N]`,
-even with `--yes`. `apply` and `remove` refuse symlinked profile directories and
-`user.js` files. Launching uses `std::process::Command`, never a shell.
+`list` without `--browser` aggregates Firefox and LibreWolf as sorted,
+browser-qualified names; `--all` also includes registered profiles. `remove`
+removes its exact registry entry after deletion (or cleans up a missing listed
+directory) without rewriting unrelated INI sections or leaving a default entry
+pointing at it. `remove` only deletes profiles carrying `.browserprofile-owned`
+unless an unmanaged registered profile is explicitly confirmed. `apply`,
+`default set`, and `remove` each require their own lowercase-`y` `[y|N]` prompt
+for unmanaged registered profiles; each prompt identifies the resolved target
+directory, and `--yes` never bypasses it. Removing a browser-default owned profile always asks `Remove browser default profile NAME?
+[y|N]`, even with `--yes`. `apply` and `remove` refuse symlinked profile
+directories and `user.js` files. Launching uses `std::process::Command`, never
+a shell. CLI mistakes print a concise usage line and exit 2; operational failures print `bp: ...` and exit 1.

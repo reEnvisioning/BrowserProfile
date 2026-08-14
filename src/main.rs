@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -107,25 +108,26 @@ fn template(browser: Browser) -> &'static str {
         Browser::Librewolf => include_str!("../templates/librewolf.user.js"),
     }
 }
-fn write_user_js(dir: &Path, browser: Browser, backup: bool) -> io::Result<()> {
+fn validate_user_js(dir: &Path, backup: bool) -> io::Result<()> {
     safe_dir(dir)?;
     let file = dir.join("user.js");
-    if file.is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "refusing symlinked user.js",
-        ));
-    }
-    let backup_file = dir.join("user.js.browserprofile-backup");
-    if backup && file.exists() {
+    if file.exists() {
         let file_type = fs::symlink_metadata(&file)?.file_type();
-        if !file_type.is_file() || file_type.is_symlink() {
+        if file_type.is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "refusing symlinked user.js",
+            ));
+        }
+        if !file_type.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "user.js must be a regular file",
             ));
         }
-        let backup_type = fs::symlink_metadata(&backup_file)
+    }
+    if backup && file.exists() {
+        let backup_type = fs::symlink_metadata(dir.join("user.js.browserprofile-backup"))
             .map(|m| m.file_type())
             .ok();
         if backup_type.is_some_and(|ty| ty.is_symlink() || !ty.is_file()) {
@@ -134,8 +136,15 @@ fn write_user_js(dir: &Path, browser: Browser, backup: bool) -> io::Result<()> {
                 "backup must be a regular file",
             ));
         }
+    }
+    Ok(())
+}
+fn write_user_js(dir: &Path, browser: Browser, backup: bool) -> io::Result<()> {
+    validate_user_js(dir, backup)?;
+    let file = dir.join("user.js");
+    if backup && file.exists() {
         let contents = fs::read(&file)?;
-        atomic_write(&backup_file, &contents)?;
+        atomic_write(&dir.join("user.js.browserprofile-backup"), &contents)?;
     }
     atomic_write(&file, template(browser).as_bytes())
 }
@@ -535,11 +544,48 @@ fn resolve(browser: Browser, name: &str) -> io::Result<PathBuf> {
     }
     Ok(owned)
 }
+fn is_owned_profile(browser: Browser, name: &str, path: &Path) -> bool {
+    path == profile_dir(browser, name) && owned_marker(path)
+}
+fn protected_root(path: &Path) -> bool {
+    path == Path::new("/")
+        || env::var_os("HOME").is_some_and(|home| path == Path::new(&home))
+        || path == data_root()
+        || path == data_root().join("firefox")
+        || path == data_root().join("librewolf")
+        || path == config_root()
+}
+fn require_unambiguous_profile(
+    profiles: &[(String, PathBuf)],
+    name: &str,
+    target: &Path,
+) -> io::Result<()> {
+    if profiles
+        .iter()
+        .any(|(known, path)| known != name && same_path(path, target))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "profile path collision",
+        ));
+    }
+    Ok(())
+}
+fn confirm_unmanaged(operation: &str, name: &str, dir: &Path) -> io::Result<bool> {
+    print!(
+        "{operation} unmanaged registered profile {name} at {}? [y|N] ",
+        dir.display()
+    );
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(answer.trim() == "y")
+}
 fn set_default(browser: Browser, name: &str) -> io::Result<()> {
     let _lock = MutationLock::acquire(browser)?;
-    set_default_locked(browser, name)
+    set_default_locked(browser, name, true)
 }
-fn set_default_locked(browser: Browser, name: &str) -> io::Result<()> {
+fn set_default_locked(browser: Browser, name: &str, confirm: bool) -> io::Result<()> {
     if !valid_name(name) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -551,7 +597,7 @@ fn set_default_locked(browser: Browser, name: &str) -> io::Result<()> {
     let owned = profile_dir(browser, name);
     let target = match (
         owned.is_dir(),
-        discovered.into_iter().find(|(n, _)| n == name),
+        discovered.iter().find(|(n, _)| n == name).cloned(),
     ) {
         (true, Some((_, path))) if !same_path(&owned, &path) => {
             return Err(io::Error::new(
@@ -568,12 +614,25 @@ fn set_default_locked(browser: Browser, name: &str) -> io::Result<()> {
             ))
         }
     };
+    require_unambiguous_profile(&discovered, name, &target)?;
     safe_dir(&target)?;
+    if protected_root(&target) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "refusing protected profile root",
+        ));
+    }
     if !target.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "profile does not exist",
         ));
+    }
+    if confirm
+        && !is_owned_profile(browser, name, &target)
+        && !confirm_unmanaged("Set default for", name, &target)?
+    {
+        return Ok(());
     }
     reject_symlink_ancestors(&ini)?;
     let text = if ini.exists() {
@@ -748,7 +807,7 @@ fn create_locked(browser: Browser, name: &str, make_default: bool) -> io::Result
             .create_new(true)
             .open(dir.join(MARKER))?;
         if make_default {
-            set_default_locked(browser, name)?;
+            set_default_locked(browser, name, false)?;
         } else {
             register_profile_locked(browser, name)?;
         }
@@ -759,25 +818,91 @@ fn create_locked(browser: Browser, name: &str, make_default: bool) -> io::Result
     }
     result
 }
-fn list(browser: Browser, all: bool) -> io::Result<()> {
+fn list_names(browser: Browser, all: bool) -> io::Result<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
     let root = data_root().join(browser.as_str());
     if root.exists() {
-        for e in fs::read_dir(root)? {
-            let e = e?;
-            if e.file_type()?.is_dir()
-                && (all
-                    || fs::symlink_metadata(e.path().join(MARKER))
-                        .map(|m| m.is_file() && !m.file_type().is_symlink())
-                        .unwrap_or(false))
-            {
-                println!("{}", e.file_name().to_string_lossy());
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() && (all || owned_marker(&entry.path())) {
+                names.insert(entry.file_name().to_string_lossy().into_owned());
             }
         }
     }
     if all {
-        for (name, _) in profiles_from_ini(browser)? {
-            println!("{name}");
+        names.extend(
+            profiles_from_ini(browser)?
+                .into_iter()
+                .map(|(name, _)| name),
+        );
+    }
+    Ok(names)
+}
+fn list(browser: Option<Browser>, all: bool) -> io::Result<()> {
+    let browsers = match browser {
+        Some(browser) => vec![browser],
+        None => vec![Browser::Firefox, Browser::Librewolf],
+    };
+    let qualified = browser.is_none();
+    for browser in browsers {
+        if browser == Browser::Librewolf {
+            reconcile_librewolf()?;
         }
+        for name in list_names(browser, all)? {
+            if qualified {
+                println!("{}:{name}", browser.as_str());
+            } else {
+                println!("{name}");
+            }
+        }
+    }
+    Ok(())
+}
+fn unregister_profile_locked(browser: Browser, name: &str, target: &Path) -> io::Result<()> {
+    let ini = ini_path(browser);
+    reject_symlink_ancestors(&ini)?;
+    let text = match fs::read_to_string(&ini) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let parsed = profiles(&text);
+    let mut remove_sections = BTreeSet::new();
+    for profile in &parsed {
+        if profile.name.as_deref() == Some(name) {
+            if let Some(path) = profile.path.as_deref() {
+                if same_path(&resolve_ini_path(&ini, path, profile.relative)?, target) {
+                    remove_sections.insert(profile.section.as_str());
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut section = "";
+    let mut changed = false;
+    for line in text.lines() {
+        if line.starts_with('[') && line.ends_with(']') {
+            section = &line[1..line.len() - 1];
+        }
+        if remove_sections.contains(section) {
+            changed = true;
+            continue;
+        }
+        if is_install_section(section) {
+            if let Some(path) = line.strip_prefix("Default=") {
+                if same_path(
+                    &resolve_ini_path(&ini, path, Path::new(path).is_relative())?,
+                    target,
+                ) {
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+        out.push(line);
+    }
+    if changed {
+        atomic_write(&ini, (out.join("\n") + "\n").as_bytes())?;
     }
     Ok(())
 }
@@ -792,43 +917,93 @@ fn remove_locked(browser: Browser, name: &str, yes: bool) -> io::Result<()> {
             "invalid profile name",
         ));
     }
-    let dir = profile_dir(browser, name);
+    let expected = profile_dir(browser, name);
+    let registered_profiles = profiles_from_ini(browser)?;
+    let registered = registered_profiles
+        .iter()
+        .find(|(known, _)| known == name)
+        .cloned();
+    let dir = match (is_owned_profile(browser, name, &expected), registered) {
+        (true, Some((_, path))) if !same_path(&expected, &path) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "profile name collision",
+            ));
+        }
+        (true, _) => expected,
+        (false, Some((_, path))) => path,
+        (false, None) => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "profile is not browserprofile-owned or registered",
+            ));
+        }
+    };
+    require_unambiguous_profile(&registered_profiles, name, &dir)?;
     safe_dir(&dir)?;
-    if !dir.join(MARKER).is_file() {
+    if protected_root(&dir) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "profile is not browserprofile-owned",
+            "refusing protected profile root",
         ));
     }
-    if dir.join("user.js").is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "refusing symlinked user.js",
-        ));
-    }
-    if dir.join(MARKER).is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "refusing symlinked ownership marker",
-        ));
+    let owned = is_owned_profile(browser, name, &dir);
+    if dir.exists() {
+        if let Ok(metadata) = fs::symlink_metadata(dir.join(MARKER)) {
+            if metadata.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "refusing symlinked ownership marker",
+                ));
+            }
+            if !metadata.file_type().is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "ownership marker must be a regular file",
+                ));
+            }
+        }
+        if !dir.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "profile path is not a directory",
+            ));
+        }
+        if owned_marker(&dir) && !owned {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "profile ownership mismatch",
+            ));
+        }
+        validate_user_js(&dir, false)?;
     }
     let is_default = default_profile(browser)?
         .map(|(_, default_dir)| same_path(&default_dir, &dir))
         .unwrap_or(false);
-    if is_default || !yes {
-        if is_default {
-            print!("Remove browser default profile {name}? [y|N] ");
-        } else {
-            print!("Remove {name}? [y/N] ");
-        }
+    let confirmed = if !owned {
+        confirm_unmanaged("Remove", name, &dir)?
+    } else if is_default {
+        print!("Remove browser default profile {name}? [y|N] ");
         io::stdout().flush()?;
         let mut answer = String::new();
         io::stdin().read_line(&mut answer)?;
-        if answer.trim() != "y" {
-            return Ok(());
-        }
+        answer.trim() == "y"
+    } else if !yes {
+        print!("Remove {name}? [y/N] ");
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        answer.trim() == "y"
+    } else {
+        true
+    };
+    if !confirmed {
+        return Ok(());
     }
-    fs::remove_dir_all(dir)
+    if dir.exists() {
+        fs::remove_dir_all(&dir)?;
+    }
+    unregister_profile_locked(browser, name, &dir)
 }
 fn browser_argv(dir: &Path, private: bool, args: &[String]) -> Vec<String> {
     let mut argv = vec![
@@ -845,6 +1020,26 @@ fn browser_argv(dir: &Path, private: bool, args: &[String]) -> Vec<String> {
 fn apply(browser: Browser, name: &str, backup: bool) -> io::Result<()> {
     let _lock = MutationLock::acquire(browser)?;
     let dir = resolve(browser, name)?;
+    if protected_root(&dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "refusing protected profile root",
+        ));
+    }
+    validate_user_js(&dir, backup)?;
+    let registered_profiles = profiles_from_ini(browser)?;
+    let registered_name = registered_profiles
+        .iter()
+        .find(|(_, path)| same_path(path, &dir))
+        .map(|(name, _)| name.clone());
+    if let Some(registered_name) = registered_name {
+        require_unambiguous_profile(&registered_profiles, &registered_name, &dir)?;
+        if !is_owned_profile(browser, &registered_name, &dir)
+            && !confirm_unmanaged("Apply to", &registered_name, &dir)?
+        {
+            return Ok(());
+        }
+    }
     write_user_js(&dir, browser, backup)
 }
 fn launch(browser: Browser, target: &str, private: bool, args: &[String]) -> io::Result<()> {
@@ -863,7 +1058,7 @@ fn launch(browser: Browser, target: &str, private: bool, args: &[String]) -> io:
         .map(|_| ())
 }
 fn usage() {
-    eprintln!("usage: bp <list|create|apply|default|get|set|remove|launch> ...");
+    eprintln!("usage: bp <list|create|apply|default get|default set|remove|launch> ...");
 }
 fn positional_args(args: &[String]) -> Vec<&str> {
     let end = args.iter().position(|x| x == "--").unwrap_or(args.len());
@@ -1015,22 +1210,28 @@ fn validate_cli(command: &str, args: &[String]) -> io::Result<()> {
     }
     Ok(())
 }
-fn main() -> io::Result<()> {
+fn run() -> io::Result<()> {
     let mut a: Vec<String> = env::args().skip(1).collect();
     if a.is_empty() {
-        usage();
-        return Ok(());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing command",
+        ));
     }
     let command = a.remove(0);
     validate_cli(&command, &a)?;
     let before_separator = a.iter().position(|x| x == "--").unwrap_or(a.len());
+    let explicit_browser = a[..before_separator].iter().any(|arg| arg == "--browser");
     let browser = option(&a[..before_separator], "--browser", Browser::Firefox)?;
-    if browser == Browser::Librewolf {
+    if command != "list" && browser == Browser::Librewolf {
         reconcile_librewolf()?;
     }
     let positional = positional_args(&a);
     match command.as_str() {
-        "list" => list(browser, a.iter().any(|x| x == "--all")),
+        "list" => list(
+            explicit_browser.then_some(browser),
+            a.iter().any(|x| x == "--all"),
+        ),
         "create" => {
             let n = positional
                 .first()
@@ -1089,12 +1290,35 @@ fn main() -> io::Result<()> {
                 )),
             }
         }
-        _ => {
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unknown command",
+        )),
+    }
+}
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("bp: {error}");
+        if error.kind() == io::ErrorKind::InvalidInput {
             usage();
-            Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "unknown command",
-            ))
+            std::process::exit(2);
         }
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profiles_reject_duplicate_fields() {
+        let profile = &profiles("[Profile0]\nName=one\nName=two\nIsRelative=0\nPath=/tmp/one\n")[0];
+        assert!(!profile.fields_valid);
+    }
+
+    #[test]
+    fn ini_paths_reject_traversal() {
+        assert!(resolve_ini_path(Path::new("/tmp/profiles.ini"), "../outside", true).is_err());
     }
 }
