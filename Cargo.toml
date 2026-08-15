@@ -8,3 +8,7 @@ license = "MIT"
 [[bin]]
 name = "bp"
 path = "src/main.rs"
+
+[[bin]]
+name = "browserprofile"
+path = "src/main.rs"
