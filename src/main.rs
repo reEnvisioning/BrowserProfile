@@ -3,33 +3,13 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::Command as ProcessCommand;
+
+mod cli;
+
+use cli::{Browser, Command};
 
 const MARKER: &str = ".browserprofile-owned";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Browser {
-    Firefox,
-    Librewolf,
-}
-impl Browser {
-    fn parse(s: &str) -> Option<Self> {
-        match s {
-            "firefox" => Some(Self::Firefox),
-            "librewolf" => Some(Self::Librewolf),
-            _ => None,
-        }
-    }
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Firefox => "firefox",
-            Self::Librewolf => "librewolf",
-        }
-    }
-    fn executable(self) -> &'static str {
-        self.as_str()
-    }
-}
 
 fn xdg(name: &str, fallback: &str) -> PathBuf {
     env::var_os(name).map(PathBuf::from).unwrap_or_else(|| {
@@ -1052,225 +1032,33 @@ fn launch(browser: Browser, target: &str, private: bool, args: &[String]) -> io:
         ));
     }
     let argv = browser_argv(&dir, private, args);
-    Command::new(browser.executable())
+    ProcessCommand::new(browser.as_str())
         .args(&argv)
         .spawn()
         .map(|_| ())
 }
-fn usage() {
-    eprintln!("usage: bp <list|create|apply|default get|default set|remove|launch> ...");
-}
-fn positional_args(args: &[String]) -> Vec<&str> {
-    let end = args.iter().position(|x| x == "--").unwrap_or(args.len());
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < end {
-        if matches!(args[i].as_str(), "--browser" | "--template") {
-            i += 2;
-        } else if args[i].starts_with('-') {
-            i += 1;
-        } else {
-            out.push(args[i].as_str());
-            i += 1;
-        }
-    }
-    out
-}
-fn option(args: &[String], key: &str, default: Browser) -> io::Result<Browser> {
-    let mut found = None;
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == key {
-            let value = args.get(i + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing option value")
-            })?;
-            if value.starts_with('-') {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "missing option value",
-                ));
-            }
-            if found.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "duplicate option",
-                ));
-            }
-            found = Some(Browser::parse(value).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "browser must be firefox or librewolf",
-                )
-            })?);
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    Ok(found.unwrap_or(default))
-}
-fn validate_cli(command: &str, args: &[String]) -> io::Result<()> {
-    let separator = args.iter().position(|x| x == "--");
-    if separator.is_some() && command != "launch" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "-- is only valid for launch",
-        ));
-    }
-    let end = separator.unwrap_or(args.len());
-    let mut positional = 0;
-    let mut positional_values = Vec::new();
-    let mut i = 0;
-    while i < end {
-        let x = &args[i];
-        if x == "--browser" {
-            let value = args
-                .get(i + 1)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing browser"))?;
-            if Browser::parse(value).is_none() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "browser must be firefox or librewolf",
-                ));
-            }
-            i += 2;
-            continue;
-        }
-        if x == "--template" {
-            if command != "create" && command != "apply" {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "unknown option",
-                ));
-            }
-            let value = args
-                .get(i + 1)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing template"))?;
-            if value != "strict" {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "template must be strict",
-                ));
-            }
-            i += 2;
-            continue;
-        }
-        let allowed = match command {
-            "list" => ["--all"].contains(&x.as_str()),
-            "create" => ["--default"].contains(&x.as_str()),
-            "apply" => ["--backup"].contains(&x.as_str()),
-            "remove" => ["--yes"].contains(&x.as_str()),
-            "launch" => ["--private-window"].contains(&x.as_str()),
-            "default" => false,
-            _ => false,
-        };
-        if allowed {
-            i += 1;
-            continue;
-        }
-        if x.starts_with('-') {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "unknown option",
-            ));
-        }
-        positional += 1;
-        positional_values.push(x.as_str());
-        i += 1;
-    }
-    for flag in [
-        "--all",
-        "--default",
-        "--backup",
-        "--yes",
-        "--private-window",
-        "--template",
-    ] {
-        if args[..end].iter().filter(|x| x.as_str() == flag).count() > 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "duplicate option",
-            ));
-        }
-    }
-    if command == "default" {
-        let valid = positional_values.as_slice() == ["get"]
-            || (positional_values.len() == 2 && positional_values[0] == "set");
-        if !valid {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "use default get or default set <name>",
-            ));
-        }
-    } else if (command == "list" && positional != 0) || (command != "list" && positional != 1) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid arguments",
-        ));
-    }
-    Ok(())
-}
 fn run() -> io::Result<()> {
-    let mut a: Vec<String> = env::args().skip(1).collect();
-    if a.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "missing command",
-        ));
-    }
-    let command = a.remove(0);
-    validate_cli(&command, &a)?;
-    let before_separator = a.iter().position(|x| x == "--").unwrap_or(a.len());
-    let explicit_browser = a[..before_separator].iter().any(|arg| arg == "--browser");
-    let browser = option(&a[..before_separator], "--browser", Browser::Firefox)?;
-    if command != "list" && browser == Browser::Librewolf {
-        reconcile_librewolf()?;
-    }
-    let positional = positional_args(&a);
-    match command.as_str() {
-        "list" => list(
-            explicit_browser.then_some(browser),
-            a.iter().any(|x| x == "--all"),
-        ),
-        "create" => {
-            let n = positional
-                .first()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing name"))?;
-            create(browser, n, a.iter().any(|x| x == "--default"))
-        }
-        "apply" => {
-            let n = positional
-                .first()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing name"))?;
-            apply(browser, n, a.iter().any(|x| x == "--backup"))
-        }
-        "remove" => {
-            let n = positional
-                .first()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing name"))?;
-            remove(browser, n, a.iter().any(|x| x == "--yes"))
-        }
-        "launch" => {
-            let n = positional
-                .first()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing name"))?;
-            let split = a.iter().position(|x| x == "--");
-            let extra = split.map(|i| &a[i + 1..]).unwrap_or(&[]);
-            launch(
-                browser,
-                n,
-                a[..before_separator]
-                    .iter()
-                    .any(|x| x == "--private-window"),
-                extra,
-            )
-        }
-        "default" => {
-            let sub = positional.first().copied().unwrap_or("");
-            match sub {
-                "get" => match default_profile(browser)? {
-                    Some((n, _)) => {
-                        println!("{n}");
+    let command = cli::parse(env::args().skip(1).collect())?;
+    match command {
+        Command::List { browser, all } => list(browser, all),
+        command => {
+            if command.browser() == Some(Browser::Librewolf) {
+                reconcile_librewolf()?;
+            }
+            match command {
+                Command::Create {
+                    browser,
+                    name,
+                    default,
+                } => create(browser, &name, default),
+                Command::Apply {
+                    browser,
+                    name,
+                    backup,
+                } => apply(browser, &name, backup),
+                Command::DefaultGet { browser } => match default_profile(browser)? {
+                    Some((name, _)) => {
+                        println!("{name}");
                         Ok(())
                     }
                     None => Err(io::Error::new(
@@ -1278,29 +1066,24 @@ fn run() -> io::Result<()> {
                         "no default profile",
                     )),
                 },
-                "set" => {
-                    let n = positional.get(1).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "missing name")
-                    })?;
-                    set_default(browser, n)
-                }
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "use default get or default set",
-                )),
+                Command::DefaultSet { browser, name } => set_default(browser, &name),
+                Command::Remove { browser, name, yes } => remove(browser, &name, yes),
+                Command::Launch {
+                    browser,
+                    name,
+                    private,
+                    args,
+                } => launch(browser, &name, private, &args),
+                Command::List { .. } => unreachable!(),
             }
         }
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "unknown command",
-        )),
     }
 }
 fn main() {
     if let Err(error) = run() {
         eprintln!("bp: {error}");
         if error.kind() == io::ErrorKind::InvalidInput {
-            usage();
+            cli::usage();
             std::process::exit(2);
         }
         std::process::exit(1);
