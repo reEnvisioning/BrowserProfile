@@ -7,7 +7,7 @@ use std::process::Command as ProcessCommand;
 
 mod cli;
 
-use cli::{Browser, Command};
+use cli::{Browser, Command, ProfileId, Selector};
 
 const MARKER: &str = ".browserprofile-owned";
 
@@ -53,6 +53,7 @@ fn reject_symlink_ancestors(path: &Path) -> io::Result<()> {
 }
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
+        && name != "default"
         && !name.starts_with('.')
         && name
             .bytes()
@@ -177,6 +178,7 @@ struct MutationLock {
 impl MutationLock {
     fn acquire(browser: Browser) -> io::Result<Self> {
         let root = data_root().join(browser.as_str());
+        reject_symlink_ancestors(&root)?;
         fs::create_dir_all(&root)?;
         let path = root.join(".browserprofile.lock");
         fs::create_dir(&path).map_err(|error| {
@@ -196,6 +198,198 @@ impl Drop for MutationLock {
     fn drop(&mut self) {
         let _ = fs::remove_dir(&self.path);
     }
+}
+
+struct CatalogLock {
+    _lock: MutationLock,
+}
+impl CatalogLock {
+    fn acquire() -> io::Result<Self> {
+        let root = data_root();
+        reject_symlink_ancestors(&root)?;
+        fs::create_dir_all(&root)?;
+        let path = root.join(".browserprofile.catalog.lock");
+        fs::create_dir(&path).map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "another browserprofile mutation is running",
+                )
+            } else {
+                error
+            }
+        })?;
+        Ok(Self {
+            _lock: MutationLock { path },
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CatalogEntry {
+    id: ProfileId,
+    browser: Browser,
+    name: String,
+}
+fn catalog_path() -> PathBuf {
+    data_root().join("profiles.catalog")
+}
+fn read_catalog() -> io::Result<Vec<CatalogEntry>> {
+    let path = catalog_path();
+    reject_symlink_ancestors(&path)?;
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(text) = text.strip_suffix('\n') else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid profile catalog",
+        ));
+    };
+    let mut entries = Vec::new();
+    for line in text.split('\n') {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid profile catalog",
+            ));
+        }
+        let entry = CatalogEntry {
+            id: ProfileId::parse(fields[0]).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid profile catalog")
+            })?,
+            browser: Browser::parse(fields[1]).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid profile catalog")
+            })?,
+            name: fields[2].into(),
+        };
+        if !valid_name(&entry.name)
+            || entries.iter().any(|known: &CatalogEntry| {
+                known.id == entry.id || (known.browser == entry.browser && known.name == entry.name)
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "duplicate or invalid profile catalog entry",
+            ));
+        }
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+fn write_catalog(entries: &[CatalogEntry]) -> io::Result<()> {
+    let mut entries = entries.to_vec();
+    entries.sort_by_key(|entry| entry.id);
+    let text = entries
+        .into_iter()
+        .map(|entry| {
+            format!(
+                "@{}\t{}\t{}",
+                entry.id.0,
+                entry.browser.as_str(),
+                entry.name
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = if text.is_empty() {
+        text
+    } else {
+        format!("{text}\n")
+    };
+    atomic_write(&catalog_path(), text.as_bytes())
+}
+fn catalog_assignment_available(
+    browser: Browser,
+    name: &str,
+    requested: Option<ProfileId>,
+) -> io::Result<()> {
+    if !valid_name(name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid profile name",
+        ));
+    }
+    let entries = read_catalog()?;
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.browser == browser && entry.name == name)
+    {
+        if requested.is_some_and(|id| id != entry.id) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "profile already has a different ID",
+            ));
+        }
+    }
+    if requested.is_some_and(|id| {
+        entries
+            .iter()
+            .any(|entry| entry.id == id && !(entry.browser == browser && entry.name == name))
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "profile ID is already assigned",
+        ));
+    }
+    Ok(())
+}
+fn catalog_id(browser: Browser, name: &str, requested: Option<ProfileId>) -> io::Result<ProfileId> {
+    if !valid_name(name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid profile name",
+        ));
+    }
+    let mut entries = read_catalog()?;
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.browser == browser && entry.name == name)
+    {
+        if requested.is_some_and(|id| id != entry.id) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "profile already has a different ID",
+            ));
+        }
+        return Ok(entry.id);
+    }
+    let id = match requested {
+        Some(id) => id,
+        None => {
+            let mut id = 1;
+            while entries.iter().any(|entry| entry.id.0 == id) {
+                id = id.checked_add(1).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::AlreadyExists, "no profile IDs available")
+                })?;
+            }
+            ProfileId(id)
+        }
+    };
+    if entries.iter().any(|entry| entry.id == id) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "profile ID is already assigned",
+        ));
+    }
+    entries.push(CatalogEntry {
+        id,
+        browser,
+        name: name.into(),
+    });
+    write_catalog(&entries)?;
+    Ok(id)
+}
+fn catalog_remove(browser: Browser, name: &str) -> io::Result<()> {
+    let mut entries = read_catalog()?;
+    entries.retain(|entry| entry.browser != browser || entry.name != name);
+    write_catalog(&entries)
 }
 
 #[derive(Default, Debug)]
@@ -364,6 +558,23 @@ fn reconcile_librewolf() -> io::Result<()> {
         register_profile_locked(Browser::Librewolf, &name)?;
     }
     Ok(())
+}
+fn reconcile_for(browser: Option<Browser>) -> io::Result<()> {
+    if browser != Some(Browser::Firefox) {
+        reconcile_librewolf()?;
+    }
+    Ok(())
+}
+fn reconcile_selector(browser: Option<Browser>, selector: &Selector) -> io::Result<()> {
+    let browser = match (browser, selector) {
+        (Some(browser), _) => Some(browser),
+        (None, Selector::Name(_)) => None,
+        (None, Selector::Id(id)) => read_catalog()?
+            .into_iter()
+            .find(|entry| entry.id == *id)
+            .map(|entry| entry.browser),
+    };
+    reconcile_for(browser)
 }
 fn default_profile(browser: Browser) -> io::Result<Option<(String, PathBuf)>> {
     let path = ini_path(browser);
@@ -551,21 +762,47 @@ fn require_unambiguous_profile(
     }
     Ok(())
 }
+fn open_tty() -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no controlling terminal for prompt",
+            )
+        })
+}
+fn require_tty() -> io::Result<()> {
+    open_tty().map(|_| ())
+}
+fn prompt(message: &str) -> io::Result<String> {
+    let mut tty = open_tty()?;
+    eprint!("{message}");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    use std::io::BufRead;
+    io::BufReader::new(&mut tty).read_line(&mut answer)?;
+    Ok(answer.trim_end_matches(['\r', '\n']).to_owned())
+}
+fn prompt_browser() -> io::Result<Browser> {
+    match prompt("Browser [firefox (default)|librewolf]: ")?.as_str() {
+        "" | "firefox" => Ok(Browser::Firefox),
+        "librewolf" => Ok(Browser::Librewolf),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "browser must be firefox or librewolf",
+        )),
+    }
+}
 fn confirm_unmanaged(operation: &str, name: &str, dir: &Path) -> io::Result<bool> {
-    print!(
+    Ok(prompt(&format!(
         "{operation} unmanaged registered profile {name} at {}? [y|N] ",
         dir.display()
-    );
-    io::stdout().flush()?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
-    Ok(answer.trim() == "y")
+    ))? == "y")
 }
-fn set_default(browser: Browser, name: &str) -> io::Result<()> {
-    let _lock = MutationLock::acquire(browser)?;
-    set_default_locked(browser, name, true)
-}
-fn set_default_locked(browser: Browser, name: &str, confirm: bool) -> io::Result<()> {
+fn set_default_locked(browser: Browser, name: &str) -> io::Result<()> {
     if !valid_name(name) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -607,12 +844,6 @@ fn set_default_locked(browser: Browser, name: &str, confirm: bool) -> io::Result
             io::ErrorKind::NotFound,
             "profile does not exist",
         ));
-    }
-    if confirm
-        && !is_owned_profile(browser, name, &target)
-        && !confirm_unmanaged("Set default for", name, &target)?
-    {
-        return Ok(());
     }
     reject_symlink_ancestors(&ini)?;
     let text = if ini.exists() {
@@ -754,10 +985,6 @@ fn register_profile_locked(browser: Browser, name: &str) -> io::Result<()> {
     atomic_write(&ini, (out.join("\n") + "\n").as_bytes())
 }
 
-fn create(browser: Browser, name: &str, make_default: bool) -> io::Result<()> {
-    let _lock = MutationLock::acquire(browser)?;
-    create_locked(browser, name, make_default)
-}
 fn create_locked(browser: Browser, name: &str, make_default: bool) -> io::Result<()> {
     if !valid_name(name) {
         return Err(io::Error::new(
@@ -787,7 +1014,7 @@ fn create_locked(browser: Browser, name: &str, make_default: bool) -> io::Result
             .create_new(true)
             .open(dir.join(MARKER))?;
         if make_default {
-            set_default_locked(browser, name, false)?;
+            set_default_locked(browser, name)?;
         } else {
             register_profile_locked(browser, name)?;
         }
@@ -817,26 +1044,6 @@ fn list_names(browser: Browser, all: bool) -> io::Result<BTreeSet<String>> {
         );
     }
     Ok(names)
-}
-fn list(browser: Option<Browser>, all: bool) -> io::Result<()> {
-    let browsers = match browser {
-        Some(browser) => vec![browser],
-        None => vec![Browser::Firefox, Browser::Librewolf],
-    };
-    let qualified = browser.is_none();
-    for browser in browsers {
-        if browser == Browser::Librewolf {
-            reconcile_librewolf()?;
-        }
-        for name in list_names(browser, all)? {
-            if qualified {
-                println!("{}:{name}", browser.as_str());
-            } else {
-                println!("{name}");
-            }
-        }
-    }
-    Ok(())
 }
 fn unregister_profile_locked(browser: Browser, name: &str, target: &Path) -> io::Result<()> {
     let ini = ini_path(browser);
@@ -886,11 +1093,7 @@ fn unregister_profile_locked(browser: Browser, name: &str, target: &Path) -> io:
     }
     Ok(())
 }
-fn remove(browser: Browser, name: &str, yes: bool) -> io::Result<()> {
-    let _lock = MutationLock::acquire(browser)?;
-    remove_locked(browser, name, yes)
-}
-fn remove_locked(browser: Browser, name: &str, yes: bool) -> io::Result<()> {
+fn remove_locked(browser: Browser, name: &str) -> io::Result<()> {
     if !valid_name(name) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -957,33 +1160,12 @@ fn remove_locked(browser: Browser, name: &str, yes: bool) -> io::Result<()> {
         }
         validate_user_js(&dir, false)?;
     }
-    let is_default = default_profile(browser)?
-        .map(|(_, default_dir)| same_path(&default_dir, &dir))
-        .unwrap_or(false);
-    let confirmed = if !owned {
-        confirm_unmanaged("Remove", name, &dir)?
-    } else if is_default {
-        print!("Remove browser default profile {name}? [y|N] ");
-        io::stdout().flush()?;
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer)?;
-        answer.trim() == "y"
-    } else if !yes {
-        print!("Remove {name}? [y/N] ");
-        io::stdout().flush()?;
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer)?;
-        answer.trim() == "y"
-    } else {
-        true
-    };
-    if !confirmed {
-        return Ok(());
-    }
     if dir.exists() {
         fs::remove_dir_all(&dir)?;
     }
-    unregister_profile_locked(browser, name, &dir)
+    unregister_profile_locked(browser, name, &dir)?;
+    // Keep the ID reserved if this write fails after deletion.
+    catalog_remove(browser, name)
 }
 fn browser_argv(dir: &Path, private: bool, args: &[String]) -> Vec<String> {
     let mut argv = vec![
@@ -997,8 +1179,7 @@ fn browser_argv(dir: &Path, private: bool, args: &[String]) -> Vec<String> {
     argv.extend_from_slice(args);
     argv
 }
-fn apply(browser: Browser, name: &str, backup: bool) -> io::Result<()> {
-    let _lock = MutationLock::acquire(browser)?;
+fn apply_locked(browser: Browser, name: &str, backup: bool) -> io::Result<()> {
     let dir = resolve(browser, name)?;
     if protected_root(&dir) {
         return Err(io::Error::new(
@@ -1014,11 +1195,6 @@ fn apply(browser: Browser, name: &str, backup: bool) -> io::Result<()> {
         .map(|(name, _)| name.clone());
     if let Some(registered_name) = registered_name {
         require_unambiguous_profile(&registered_profiles, &registered_name, &dir)?;
-        if !is_owned_profile(browser, &registered_name, &dir)
-            && !confirm_unmanaged("Apply to", &registered_name, &dir)?
-        {
-            return Ok(());
-        }
     }
     write_user_js(&dir, browser, backup)
 }
@@ -1037,45 +1213,415 @@ fn launch(browser: Browser, target: &str, private: bool, args: &[String]) -> io:
         .spawn()
         .map(|_| ())
 }
+fn resolve_selector(
+    browser: Option<Browser>,
+    selector: Selector,
+    allow_default: bool,
+) -> io::Result<(Browser, String)> {
+    match selector {
+        Selector::Id(id) => {
+            let entry = read_catalog()?
+                .into_iter()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown profile ID"))?;
+            if browser.is_some_and(|browser| browser != entry.browser) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "profile ID belongs to a different browser",
+                ));
+            }
+            let path = resolve(entry.browser, &entry.name)?;
+            safe_dir(&path)?;
+            if !path.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "profile does not exist",
+                ));
+            }
+            Ok((entry.browser, entry.name))
+        }
+        Selector::Name(name) => {
+            let browser = browser.map(Ok).unwrap_or_else(prompt_browser)?;
+            let resolved_name = if name == "default" && allow_default {
+                default_profile(browser)?
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no default profile"))?
+                    .0
+            } else if name == "default" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "default is only valid for apply or launch",
+                ));
+            } else {
+                name
+            };
+            let path = resolve(browser, &resolved_name)?;
+            safe_dir(&path)?;
+            if !path.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "profile does not exist",
+                ));
+            }
+            Ok((browser, resolved_name))
+        }
+    }
+}
+#[derive(Clone, Copy)]
+enum Mutation {
+    Apply,
+    Default,
+    Remove { yes: bool },
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Confirmation {
+    None,
+    Unmanaged,
+    Default,
+    Remove,
+}
+#[derive(PartialEq, Eq)]
+struct MutationTarget {
+    browser: Browser,
+    name: String,
+    path: PathBuf,
+    owned: bool,
+    default: bool,
+    confirmation: Confirmation,
+}
+fn mutation_target(browser: Browser, name: &str, mutation: Mutation) -> io::Result<MutationTarget> {
+    let path = resolve(browser, name)?;
+    safe_dir(&path)?;
+    if !path.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "profile does not exist",
+        ));
+    }
+    let owned = is_owned_profile(browser, name, &path);
+    let default =
+        default_profile(browser)?.is_some_and(|(_, default_path)| same_path(&default_path, &path));
+    let confirmation = match mutation {
+        Mutation::Apply
+            if profiles_from_ini(browser)?
+                .iter()
+                .find(|(_, registered_path)| same_path(registered_path, &path))
+                .is_some_and(|(registered_name, _)| {
+                    !is_owned_profile(browser, registered_name, &path)
+                }) =>
+        {
+            Confirmation::Unmanaged
+        }
+        Mutation::Default if !owned => Confirmation::Unmanaged,
+        Mutation::Remove { .. } if !owned => Confirmation::Unmanaged,
+        Mutation::Remove { .. } if default => Confirmation::Default,
+        Mutation::Remove { yes: false } => Confirmation::Remove,
+        _ => Confirmation::None,
+    };
+    Ok(MutationTarget {
+        browser,
+        name: name.into(),
+        path,
+        owned,
+        default,
+        confirmation,
+    })
+}
+fn confirm_target(target: &MutationTarget, operation: &str) -> io::Result<bool> {
+    match target.confirmation {
+        Confirmation::None => Ok(true),
+        Confirmation::Unmanaged => confirm_unmanaged(operation, &target.name, &target.path),
+        Confirmation::Default => Ok(prompt(&format!(
+            "Remove browser default profile {}? [y|N] ",
+            target.name
+        ))? == "y"),
+        Confirmation::Remove => Ok(prompt(&format!("Remove {}? [y/N] ", target.name))? == "y"),
+    }
+}
+fn retry() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "profile changed while waiting for lock; retry",
+    )
+}
+fn lock_target(
+    target: &MutationTarget,
+    mutation: Mutation,
+) -> io::Result<(MutationLock, CatalogLock)> {
+    let mutation_lock = MutationLock::acquire(target.browser)?;
+    let catalog_lock = CatalogLock::acquire()?;
+    if mutation_target(target.browser, &target.name, mutation)? != *target {
+        return Err(retry());
+    }
+    Ok((mutation_lock, catalog_lock))
+}
+fn revalidate_selector(
+    browser: Option<Browser>,
+    selector: Selector,
+    allow_default: bool,
+    target: &MutationTarget,
+) -> io::Result<()> {
+    if resolve_selector(browser, selector, allow_default)? != (target.browser, target.name.clone())
+    {
+        return Err(retry());
+    }
+    Ok(())
+}
+fn create_with_id(
+    id: Option<ProfileId>,
+    browser: Option<Browser>,
+    name: Option<String>,
+    default: Option<bool>,
+) -> io::Result<()> {
+    let name = match name {
+        Some(name) => name,
+        None => prompt("Profile name: ")?,
+    };
+    let browser = match browser {
+        Some(browser) => browser,
+        None => prompt_browser()?,
+    };
+    let make_default = match default {
+        Some(default) => default,
+        None => prompt("Make default? [N|y] ")? == "y",
+    };
+    reconcile_for(Some(browser))?;
+    let _mutation_lock = MutationLock::acquire(browser)?;
+    let _catalog_lock = CatalogLock::acquire()?;
+    catalog_assignment_available(browser, &name, id)?;
+    let existing = read_catalog()?
+        .iter()
+        .any(|entry| entry.browser == browser && entry.name == name);
+    let id = catalog_id(browser, &name, id)?;
+    if let Err(error) = create_locked(browser, &name, make_default) {
+        if !existing {
+            if let Err(cleanup) = catalog_remove(browser, &name) {
+                return Err(io::Error::new(
+                    cleanup.kind(),
+                    format!("{error}; catalog rollback failed: {cleanup}"),
+                ));
+            }
+        }
+        return Err(error);
+    }
+    println!("@{}\t{}\t{}", id.0, browser.as_str(), name);
+    Ok(())
+}
+fn list_with_ids(browser: Option<Browser>, all: bool) -> io::Result<()> {
+    let browsers = browser
+        .map(|browser| vec![browser])
+        .unwrap_or_else(|| vec![Browser::Firefox, Browser::Librewolf]);
+    let mut rows = Vec::new();
+    for browser in browsers {
+        for name in list_names(browser, all)? {
+            if !valid_name(&name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsafe profile name",
+                ));
+            }
+            let path = resolve(browser, &name)?;
+            safe_dir(&path)?;
+            if !path.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "profile does not exist",
+                ));
+            }
+            rows.push((catalog_id(browser, &name, None)?, browser, name));
+        }
+    }
+    rows.sort_by_key(|(id, _, _)| *id);
+    for (id, browser, name) in rows {
+        println!("@{}\t{}\t{}", id.0, browser.as_str(), name);
+    }
+    Ok(())
+}
+fn prompt_selector_browser(
+    browser: Option<Browser>,
+    selector: &Selector,
+) -> io::Result<Option<Browser>> {
+    if browser.is_none() && matches!(selector, Selector::Name(_)) {
+        Ok(Some(prompt_browser()?))
+    } else {
+        Ok(browser)
+    }
+}
+fn launchable_profiles(browser: Option<Browser>) -> io::Result<Vec<CatalogEntry>> {
+    let browsers = browser
+        .map(|browser| vec![browser])
+        .unwrap_or_else(|| vec![Browser::Firefox, Browser::Librewolf]);
+    let mut choices = Vec::new();
+    for browser in browsers {
+        let mut names = list_names(browser, false)?;
+        names.extend(
+            profiles_from_ini(browser)?
+                .into_iter()
+                .map(|(name, _)| name),
+        );
+        for name in names {
+            if !valid_name(&name) {
+                continue;
+            }
+            let Ok(path) = resolve(browser, &name) else {
+                continue;
+            };
+            if safe_dir(&path).is_ok() && path.is_dir() {
+                choices.push(CatalogEntry {
+                    id: catalog_id(browser, &name, None)?,
+                    browser,
+                    name,
+                });
+            }
+        }
+    }
+    choices.sort_by_key(|choice| choice.id);
+    Ok(choices)
+}
+fn pick_profile(browser: Option<Browser>) -> io::Result<CatalogEntry> {
+    let choices = {
+        let _catalog_lock = CatalogLock::acquire()?;
+        launchable_profiles(browser)?
+    };
+    if choices.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no launchable profiles",
+        ));
+    }
+    let mut tty = open_tty()?;
+    for choice in &choices {
+        writeln!(
+            tty,
+            "@{} {} ({})",
+            choice.id.0,
+            choice.name,
+            choice.browser.as_str()
+        )?;
+    }
+    write!(tty, "Profile ID: ")?;
+    tty.flush()?;
+    let mut answer = String::new();
+    use std::io::BufRead;
+    io::BufReader::new(&mut tty).read_line(&mut answer)?;
+    let id = ProfileId::parse(answer.trim_end_matches(['\r', '\n']))?;
+    choices
+        .into_iter()
+        .find(|choice| choice.id == id)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid profile ID"))
+}
+fn launch_from_picker(browser: Option<Browser>, private: bool, args: &[String]) -> io::Result<()> {
+    let choice = pick_profile(browser)?;
+    let _catalog_lock = CatalogLock::acquire()?;
+    let (selected_browser, name) = resolve_selector(browser, Selector::Id(choice.id), true)?;
+    if (selected_browser, name.as_str()) != (choice.browser, choice.name.as_str()) {
+        return Err(retry());
+    }
+    launch(selected_browser, &name, private, args)
+}
 fn run() -> io::Result<()> {
-    let command = cli::parse(env::args().skip(1).collect())?;
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args.as_slice() == ["help"] {
+        println!("{}", cli::HELP);
+        return Ok(());
+    }
+    let command = cli::parse(args)?;
     match command {
-        Command::List { browser, all } => list(browser, all),
-        command => {
-            if command.browser() == Some(Browser::Librewolf) {
-                reconcile_librewolf()?;
+        Command::List { browser, all } => {
+            reconcile_for(browser)?;
+            let _catalog_lock = CatalogLock::acquire()?;
+            list_with_ids(browser, all)
+        }
+        Command::Create {
+            id,
+            browser,
+            name,
+            default,
+        } => create_with_id(id, browser, name, default),
+        Command::DefaultGet { browser } => {
+            let browser = match browser {
+                Some(browser) => browser,
+                None => prompt_browser()?,
+            };
+            reconcile_for(Some(browser))?;
+            let _catalog_lock = CatalogLock::acquire()?;
+            let (name, _) = default_profile(browser)?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no default profile"))?;
+            let id = catalog_id(browser, &name, None)?;
+            println!("@{}\t{}\t{}", id.0, browser.as_str(), name);
+            Ok(())
+        }
+        Command::Apply {
+            browser,
+            selector,
+            backup,
+        } => {
+            let browser = prompt_selector_browser(browser, &selector)?;
+            let (selected_browser, name) = resolve_selector(browser, selector.clone(), true)?;
+            let target = mutation_target(selected_browser, &name, Mutation::Apply)?;
+            if !confirm_target(&target, "Apply to")? {
+                return Ok(());
             }
-            match command {
-                Command::Create {
-                    browser,
-                    name,
-                    default,
-                } => create(browser, &name, default),
-                Command::Apply {
-                    browser,
-                    name,
-                    backup,
-                } => apply(browser, &name, backup),
-                Command::DefaultGet { browser } => match default_profile(browser)? {
-                    Some((name, _)) => {
-                        println!("{name}");
-                        Ok(())
-                    }
-                    None => Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "no default profile",
-                    )),
-                },
-                Command::DefaultSet { browser, name } => set_default(browser, &name),
-                Command::Remove { browser, name, yes } => remove(browser, &name, yes),
-                Command::Launch {
-                    browser,
-                    name,
-                    private,
-                    args,
-                } => launch(browser, &name, private, &args),
-                Command::List { .. } => unreachable!(),
+            reconcile_selector(browser, &selector)?;
+            let (_mutation_lock, _catalog_lock) = lock_target(&target, Mutation::Apply)?;
+            revalidate_selector(browser, selector, true, &target)?;
+            read_catalog()?;
+            apply_locked(selected_browser, &name, backup)?;
+            catalog_id(selected_browser, &name, None).map(|_| ())
+        }
+        Command::DefaultSet { browser, selector } => {
+            let browser = prompt_selector_browser(browser, &selector)?;
+            let (selected_browser, name) = resolve_selector(browser, selector.clone(), false)?;
+            let target = mutation_target(selected_browser, &name, Mutation::Default)?;
+            if !confirm_target(&target, "Set default for")? {
+                return Ok(());
             }
+            reconcile_selector(browser, &selector)?;
+            let (_mutation_lock, _catalog_lock) = lock_target(&target, Mutation::Default)?;
+            revalidate_selector(browser, selector, false, &target)?;
+            read_catalog()?;
+            set_default_locked(selected_browser, &name)?;
+            catalog_id(selected_browser, &name, None).map(|_| ())
+        }
+        Command::Remove {
+            browser,
+            selector,
+            yes,
+        } => {
+            let browser = prompt_selector_browser(browser, &selector)?;
+            let (selected_browser, name) = resolve_selector(browser, selector.clone(), false)?;
+            let mutation = Mutation::Remove { yes };
+            let target = mutation_target(selected_browser, &name, mutation)?;
+            if !confirm_target(&target, "Remove")? {
+                return Ok(());
+            }
+            reconcile_selector(browser, &selector)?;
+            let (_mutation_lock, _catalog_lock) = lock_target(&target, mutation)?;
+            revalidate_selector(browser, selector, false, &target)?;
+            read_catalog()?;
+            remove_locked(selected_browser, &name)
+        }
+        Command::Launch {
+            browser,
+            selector: Some(selector),
+            private,
+            args,
+        } => {
+            let browser = prompt_selector_browser(browser, &selector)?;
+            reconcile_selector(browser, &selector)?;
+            let _catalog_lock = CatalogLock::acquire()?;
+            let (browser, name) = resolve_selector(browser, selector, true)?;
+            catalog_id(browser, &name, None)?;
+            launch(browser, &name, private, &args)
+        }
+        Command::Launch {
+            browser,
+            selector: None,
+            private,
+            args,
+        } => {
+            require_tty()?;
+            reconcile_for(browser)?;
+            launch_from_picker(browser, private, &args)
         }
     }
 }
