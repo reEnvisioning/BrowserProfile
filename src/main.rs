@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
@@ -10,6 +11,7 @@ mod cli;
 use cli::{Browser, Command, ProfileId, Selector};
 
 const MARKER: &str = ".browserprofile-owned";
+const MAX_TEMPLATE_BYTES: u64 = 1024 * 1024;
 
 fn xdg(name: &str, fallback: &str) -> PathBuf {
     env::var_os(name).map(PathBuf::from).unwrap_or_else(|| {
@@ -83,11 +85,66 @@ fn safe_dir(path: &Path) -> io::Result<()> {
     }
     Ok(())
 }
-fn template(browser: Browser) -> &'static str {
-    match browser {
-        Browser::Firefox => include_str!("../templates/firefox.user.js"),
-        Browser::Librewolf => include_str!("../templates/librewolf.user.js"),
+fn read_template(path: Option<&str>) -> io::Result<Vec<u8>> {
+    let Some(path) = path else {
+        return Ok(include_bytes!("../templates/template.user.js").to_vec());
+    };
+    let path = Path::new(path);
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "template must be a regular file",
+        ));
     }
+    let mut file = fs::File::open(path)?;
+    let opened = file.metadata()?;
+    let current = fs::symlink_metadata(path)?;
+    if !opened.is_file()
+        || !current.file_type().is_file()
+        || opened.dev() != current.dev()
+        || opened.ino() != current.ino()
+        || opened.len() > MAX_TEMPLATE_BYTES
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "template must be an unchanged regular file no larger than 1 MiB",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_TEMPLATE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_TEMPLATE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "template must be no larger than 1 MiB",
+        ));
+    }
+    Ok(bytes)
+}
+fn template_name(path: Option<&str>) -> io::Result<String> {
+    let path = Path::new(path.unwrap_or("template.user.js"));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid template filename"))?;
+    let name = name
+        .strip_suffix(".user.js")
+        .map(str::to_owned)
+        .or_else(|| {
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| name.to_owned());
+    if !valid_name(&name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid profile name",
+        ));
+    }
+    Ok(name)
 }
 fn validate_user_js(dir: &Path, backup: bool) -> io::Result<()> {
     safe_dir(dir)?;
@@ -120,14 +177,14 @@ fn validate_user_js(dir: &Path, backup: bool) -> io::Result<()> {
     }
     Ok(())
 }
-fn write_user_js(dir: &Path, browser: Browser, backup: bool) -> io::Result<()> {
+fn write_user_js(dir: &Path, template: &[u8], backup: bool) -> io::Result<()> {
     validate_user_js(dir, backup)?;
     let file = dir.join("user.js");
     if backup && file.exists() {
         let contents = fs::read(&file)?;
         atomic_write(&dir.join("user.js.browserprofile-backup"), &contents)?;
     }
-    atomic_write(&file, template(browser).as_bytes())
+    atomic_write(&file, template)
 }
 fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
     let parent = path
@@ -985,7 +1042,12 @@ fn register_profile_locked(browser: Browser, name: &str) -> io::Result<()> {
     atomic_write(&ini, (out.join("\n") + "\n").as_bytes())
 }
 
-fn create_locked(browser: Browser, name: &str, make_default: bool) -> io::Result<()> {
+fn create_locked(
+    browser: Browser,
+    name: &str,
+    template: &[u8],
+    make_default: bool,
+) -> io::Result<()> {
     if !valid_name(name) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1006,7 +1068,7 @@ fn create_locked(browser: Browser, name: &str, make_default: bool) -> io::Result
     }
     fs::create_dir_all(&dir)?;
     let result = (|| {
-        write_user_js(&dir, browser, false)?;
+        write_user_js(&dir, template, false)?;
         // The marker is the last profile-local step, before the registry can
         // change. Any later failure removes the whole new directory.
         fs::OpenOptions::new()
@@ -1179,7 +1241,7 @@ fn browser_argv(dir: &Path, private: bool, args: &[String]) -> Vec<String> {
     argv.extend_from_slice(args);
     argv
 }
-fn apply_locked(browser: Browser, name: &str, backup: bool) -> io::Result<()> {
+fn apply_locked(browser: Browser, name: &str, template: &[u8], backup: bool) -> io::Result<()> {
     let dir = resolve(browser, name)?;
     if protected_root(&dir) {
         return Err(io::Error::new(
@@ -1196,7 +1258,7 @@ fn apply_locked(browser: Browser, name: &str, backup: bool) -> io::Result<()> {
     if let Some(registered_name) = registered_name {
         require_unambiguous_profile(&registered_profiles, &registered_name, &dir)?;
     }
-    write_user_js(&dir, browser, backup)
+    write_user_js(&dir, template, backup)
 }
 fn launch(browser: Browser, target: &str, private: bool, args: &[String]) -> io::Result<()> {
     let dir = resolve(browser, target)?;
@@ -1371,11 +1433,10 @@ fn create_with_id(
     browser: Option<Browser>,
     name: Option<String>,
     default: Option<bool>,
+    template_path: Option<String>,
 ) -> io::Result<()> {
-    let name = match name {
-        Some(name) => name,
-        None => prompt("Profile name: ")?,
-    };
+    let template = read_template(template_path.as_deref())?;
+    let name = name.unwrap_or(template_name(template_path.as_deref())?);
     let browser = match browser {
         Some(browser) => browser,
         None => prompt_browser()?,
@@ -1392,7 +1453,7 @@ fn create_with_id(
         .iter()
         .any(|entry| entry.browser == browser && entry.name == name);
     let id = catalog_id(browser, &name, id)?;
-    if let Err(error) = create_locked(browser, &name, make_default) {
+    if let Err(error) = create_locked(browser, &name, &template, make_default) {
         if !existing {
             if let Err(cleanup) = catalog_remove(browser, &name) {
                 return Err(io::Error::new(
@@ -1536,7 +1597,8 @@ fn run() -> io::Result<()> {
             browser,
             name,
             default,
-        } => create_with_id(id, browser, name, default),
+            template,
+        } => create_with_id(id, browser, name, default, template),
         Command::DefaultGet { browser } => {
             let browser = match browser {
                 Some(browser) => browser,
@@ -1553,8 +1615,10 @@ fn run() -> io::Result<()> {
         Command::Apply {
             browser,
             selector,
+            template,
             backup,
         } => {
+            let template = read_template(template.as_deref())?;
             let browser = prompt_selector_browser(browser, &selector)?;
             let (selected_browser, name) = resolve_selector(browser, selector.clone(), true)?;
             let target = mutation_target(selected_browser, &name, Mutation::Apply)?;
@@ -1565,7 +1629,7 @@ fn run() -> io::Result<()> {
             let (_mutation_lock, _catalog_lock) = lock_target(&target, Mutation::Apply)?;
             revalidate_selector(browser, selector, true, &target)?;
             read_catalog()?;
-            apply_locked(selected_browser, &name, backup)?;
+            apply_locked(selected_browser, &name, &template, backup)?;
             catalog_id(selected_browser, &name, None).map(|_| ())
         }
         Command::DefaultSet { browser, selector } => {

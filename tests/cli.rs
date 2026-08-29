@@ -517,6 +517,153 @@ fn id_mutations_do_not_require_a_tty_when_managed() {
         .exists());
 }
 
+#[test]
+fn templates_use_default_names_and_exact_bytes() {
+    let fixture = Fixture::new();
+    let built_in = include_bytes!("../templates/template.user.js");
+    let default = fixture.run(bp(), &["create", "--browser", "firefox", "--default", "no"]);
+    assert!(default.status.success(), "{default:?}");
+    assert_eq!(text(&default), "@1\tfirefox\ttemplate\n");
+    let firefox = fixture
+        .data()
+        .join("browserprofile/firefox/template/user.js");
+    assert_eq!(fs::read(&firefox).unwrap(), built_in);
+
+    let librewolf = fixture.run(
+        bp(),
+        &[
+            "create",
+            "--name",
+            "librewolf",
+            "--browser",
+            "librewolf",
+            "--default",
+            "no",
+        ],
+    );
+    assert!(librewolf.status.success(), "{librewolf:?}");
+    assert_eq!(
+        fs::read(
+            fixture
+                .data()
+                .join("browserprofile/librewolf/librewolf/user.js")
+        )
+        .unwrap(),
+        fs::read(firefox).unwrap()
+    );
+
+    let search = fixture.root.join("search.user.js");
+    let create_bytes = b"user_pref(\"custom\", true);\n";
+    fs::write(&search, create_bytes).unwrap();
+    let created = fixture.run(
+        bp(),
+        &[
+            "create",
+            "--template",
+            search.to_str().unwrap(),
+            "--browser",
+            "firefox",
+            "--default",
+            "no",
+        ],
+    );
+    assert!(created.status.success(), "{created:?}");
+    assert!(text(&created).ends_with("\tfirefox\tsearch\n"));
+    let custom = fixture.data().join("browserprofile/firefox/search/user.js");
+    assert_eq!(fs::read(&custom).unwrap(), create_bytes);
+
+    let override_template = fixture.root.join("profile1.user.js");
+    fs::write(&override_template, b"override\n").unwrap();
+    let overridden = fixture.run(
+        bp(),
+        &[
+            "create",
+            "--name",
+            "named",
+            "--template",
+            override_template.to_str().unwrap(),
+            "--browser",
+            "firefox",
+            "--default",
+            "no",
+        ],
+    );
+    assert!(overridden.status.success(), "{overridden:?}");
+    assert!(fixture.data().join("browserprofile/firefox/named").is_dir());
+
+    let apply_bytes = b"user_pref(\"custom\", false);\n";
+    fs::write(&search, apply_bytes).unwrap();
+    let applied = fixture.run(
+        bp(),
+        &[
+            "apply",
+            "search",
+            "--browser",
+            "firefox",
+            "--template",
+            search.to_str().unwrap(),
+        ],
+    );
+    assert!(applied.status.success(), "{applied:?}");
+    assert_eq!(fs::read(custom).unwrap(), apply_bytes);
+}
+
+#[test]
+fn invalid_templates_fail_before_mutation() {
+    let fixture = Fixture::new();
+    let directory = fixture.root.join("directory.user.js");
+    fs::create_dir(&directory).unwrap();
+    let oversized = fixture.root.join("oversized.user.js");
+    fs::write(&oversized, vec![0; 1024 * 1024 + 1]).unwrap();
+    for template in [fixture.root.join("missing.user.js"), directory, oversized] {
+        let output = fixture.run(
+            bp(),
+            &[
+                "create",
+                "--template",
+                template.to_str().unwrap(),
+                "--browser",
+                "firefox",
+                "--default",
+                "no",
+            ],
+        );
+        assert!(!output.status.success(), "{output:?}");
+        assert!(!fixture.data().join("browserprofile").exists());
+    }
+
+    let created = fixture.run(
+        bp(),
+        &[
+            "create",
+            "--name",
+            "apply",
+            "--browser",
+            "firefox",
+            "--default",
+            "no",
+        ],
+    );
+    assert!(created.status.success(), "{created:?}");
+    let user_js = fixture.data().join("browserprofile/firefox/apply/user.js");
+    let before = fs::read(&user_js).unwrap();
+    assert!(!fixture
+        .run(
+            bp(),
+            &[
+                "apply",
+                "apply",
+                "--browser",
+                "firefox",
+                "--template",
+                fixture.root.join("missing.user.js").to_str().unwrap(),
+            ],
+        )
+        .status
+        .success());
+    assert_eq!(fs::read(user_js).unwrap(), before);
+}
+
 #[cfg(unix)]
 #[test]
 fn launch_passes_literal_arguments_to_fake_browser() {

@@ -72,10 +72,12 @@ pub enum Command {
         browser: Option<Browser>,
         name: Option<String>,
         default: Option<bool>,
+        template: Option<String>,
     },
     Apply {
         browser: Option<Browser>,
         selector: Selector,
+        template: Option<String>,
         backup: bool,
     },
     DefaultGet {
@@ -98,7 +100,7 @@ pub enum Command {
     },
 }
 
-pub const HELP: &str = "usage: bp <list|create|apply|default get|default set|remove|launch> ...\n\nProfile IDs use shell-safe @0, @1 syntax.\n\nbp create [@ID] [--name NAME] [--browser firefox|librewolf] [--default yes|no]\nbp apply @ID|NAME [--browser firefox|librewolf] [--backup]\nbp default get [--browser firefox|librewolf]\nbp default set @ID|NAME [--browser firefox|librewolf]\nbp remove @ID|NAME [--browser firefox|librewolf] [--yes]\nbp launch [@ID|NAME] [--browser firefox|librewolf] [--private-window] [-- ARGS...]\nbp list [--browser firefox|librewolf] [--all]";
+pub const HELP: &str = "usage: bp <list|create|apply|default get|default set|remove|launch> ...\n\nProfile IDs use shell-safe @0, @1 syntax.\n\nbp create [@ID] [--name NAME] [--template FILE] [--browser firefox|librewolf] [--default yes|no]\nbp apply @ID|NAME [--template FILE] [--browser firefox|librewolf] [--backup]\nbp default get [--browser firefox|librewolf]\nbp default set @ID|NAME [--browser firefox|librewolf]\nbp remove @ID|NAME [--browser firefox|librewolf] [--yes]\nbp launch [@ID|NAME] [--browser firefox|librewolf] [--private-window] [-- ARGS...]\nbp list [--browser firefox|librewolf] [--all]";
 
 pub fn usage() {
     eprintln!(
@@ -148,7 +150,7 @@ pub fn parse(args: Vec<String>) -> io::Result<Command> {
     let mut browser = None;
     let mut name = None;
     let mut default = None;
-    let mut template = false;
+    let mut template = None;
     let mut backup = false;
     let mut yes = false;
     let mut private = false;
@@ -182,11 +184,8 @@ pub fn parse(args: Vec<String>) -> io::Result<Command> {
                     _ => return Err(error("default must be yes or no")),
                 });
             }
-            "--template" if (action == "create" || action == "apply") && !template => {
-                if take_value(args, &mut i, "--template")? != "strict" {
-                    return Err(error("template must be strict"));
-                }
-                template = true;
+            "--template" if (action == "create" || action == "apply") && template.is_none() => {
+                template = Some(take_value(args, &mut i, "--template")?);
             }
             "--backup" if action == "apply" && !backup => backup = true,
             "--yes" if action == "remove" && !yes => yes = true,
@@ -221,11 +220,13 @@ pub fn parse(args: Vec<String>) -> io::Result<Command> {
                 browser,
                 name,
                 default,
+                template,
             })
         }
         "apply" => Ok(Command::Apply {
             browser,
             selector: one_selector()?,
+            template,
             backup,
         }),
         "default-get" if positional.is_empty() => Ok(Command::DefaultGet { browser }),
@@ -275,14 +276,17 @@ mod tests {
                 "--browser".into(),
                 "firefox".into(),
                 "--default".into(),
-                "no".into()
+                "no".into(),
+                "--template".into(),
+                "search.user.js".into()
             ])
             .unwrap(),
             Command::Create {
                 id: Some(ProfileId(0)),
                 name: Some("work".into()),
                 browser: Some(Browser::Firefox),
-                default: Some(false)
+                default: Some(false),
+                template: Some("search.user.js".into())
             }
         );
         assert_eq!(
@@ -322,6 +326,26 @@ mod tests {
                 args: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn parses_template_files_for_create_and_apply() {
+        assert_eq!(
+            parse(vec![
+                "apply".into(),
+                "@1".into(),
+                "--template".into(),
+                "custom.user.js".into(),
+            ])
+            .unwrap(),
+            Command::Apply {
+                browser: None,
+                selector: Selector::Id(ProfileId(1)),
+                template: Some("custom.user.js".into()),
+                backup: false,
+            }
+        );
+        assert!(parse(vec!["apply".into(), "@1".into(), "--template".into()]).is_err());
     }
 
     #[test]
