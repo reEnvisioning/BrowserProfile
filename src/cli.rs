@@ -54,7 +54,7 @@ pub enum Selector {
     Name(String),
 }
 fn selector(value: &str) -> io::Result<Selector> {
-    if value.starts_with('@') || value.starts_with('#') {
+    if value.starts_with('@') {
         ProfileId::parse(value).map(Selector::Id)
     } else {
         Ok(Selector::Name(value.into()))
@@ -260,7 +260,7 @@ mod tests {
     fn parses_canonical_ids() {
         assert_eq!(ProfileId::parse("@0").unwrap(), ProfileId(0));
         assert_eq!(ProfileId::parse("@1").unwrap(), ProfileId(1));
-        for id in ["@", "@01", "@-1", "#1", "1"] {
+        for id in ["@", "@01", "@-1", "1"] {
             assert!(ProfileId::parse(id).is_err());
         }
     }
@@ -353,7 +353,6 @@ mod tests {
         for args in [
             vec!["create", "work"],
             vec!["apply", "@01"],
-            vec!["apply", "#1"],
             vec!["create", "@1", "@2"],
             vec![
                 "default",

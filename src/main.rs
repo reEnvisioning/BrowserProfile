@@ -31,7 +31,9 @@ fn profile_dir(browser: Browser, name: &str) -> PathBuf {
 }
 fn ini_path(browser: Browser) -> PathBuf {
     match browser {
-        Browser::Firefox => config_root().join("mozilla/firefox/profiles.ini"),
+        Browser::Firefox => env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(".mozilla/firefox/profiles.ini"))
+            .unwrap_or_else(|| PathBuf::from(".mozilla/firefox/profiles.ini")),
         Browser::Librewolf => env::var_os("HOME")
             .map(|home| PathBuf::from(home).join(".librewolf/profiles.ini"))
             .unwrap_or_else(|| PathBuf::from(".librewolf/profiles.ini")),
@@ -572,67 +574,6 @@ fn profiles_from_ini_at(ini: &Path) -> io::Result<Vec<(String, PathBuf)>> {
 fn profiles_from_ini(browser: Browser) -> io::Result<Vec<(String, PathBuf)>> {
     profiles_from_ini_at(&ini_path(browser))
 }
-fn reconcile_librewolf() -> io::Result<()> {
-    let obsolete = config_root().join("librewolf/librewolf/profiles.ini");
-    if !obsolete.exists() {
-        return Ok(());
-    }
-    let _lock = MutationLock::acquire(Browser::Librewolf)?;
-    let candidates = profiles_from_ini_at(&obsolete)?
-        .into_iter()
-        .filter(|(name, path)| {
-            valid_name(name)
-                && path == &profile_dir(Browser::Librewolf, name)
-                && safe_dir(path).is_ok()
-                && owned_marker(path)
-        })
-        .collect::<Vec<_>>();
-    let known = profiles_from_ini(Browser::Librewolf)?;
-    for (name, path) in &candidates {
-        for (known_name, known_path) in &known {
-            if (name == known_name && !same_path(path, known_path))
-                || (same_path(path, known_path) && name != known_name)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "LibreWolf profile registry collision",
-                ));
-            }
-        }
-    }
-    for (index, (name, path)) in candidates.iter().enumerate() {
-        if candidates[..index]
-            .iter()
-            .any(|(known_name, known_path)| name == known_name || same_path(path, known_path))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "LibreWolf profile registry collision",
-            ));
-        }
-    }
-    for (name, _) in candidates {
-        register_profile_locked(Browser::Librewolf, &name)?;
-    }
-    Ok(())
-}
-fn reconcile_for(browser: Option<Browser>) -> io::Result<()> {
-    if browser != Some(Browser::Firefox) {
-        reconcile_librewolf()?;
-    }
-    Ok(())
-}
-fn reconcile_selector(browser: Option<Browser>, selector: &Selector) -> io::Result<()> {
-    let browser = match (browser, selector) {
-        (Some(browser), _) => Some(browser),
-        (None, Selector::Name(_)) => None,
-        (None, Selector::Id(id)) => read_catalog()?
-            .into_iter()
-            .find(|entry| entry.id == *id)
-            .map(|entry| entry.browser),
-    };
-    reconcile_for(browser)
-}
 fn default_profile(browser: Browser) -> io::Result<Option<(String, PathBuf)>> {
     let path = ini_path(browser);
     reject_symlink_ancestors(&path)?;
@@ -771,13 +712,17 @@ fn resolve(browser: Browser, name: &str) -> io::Result<PathBuf> {
         .into_iter()
         .find(|p| p.0 == name);
     if owned.is_dir() && owned_marker(&owned) {
-        if let Some((_, path)) = &discovered {
-            if !same_path(&owned, path) {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "profile name collision",
-                ));
-            }
+        let Some((_, path)) = &discovered else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "profile is not registered in profiles.ini",
+            ));
+        };
+        if !same_path(&owned, path) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "profile name collision",
+            ));
         }
         return Ok(owned);
     }
@@ -1088,24 +1033,11 @@ fn create_locked(
     result
 }
 fn list_names(browser: Browser, all: bool) -> io::Result<BTreeSet<String>> {
-    let mut names = BTreeSet::new();
-    let root = data_root().join(browser.as_str());
-    if root.exists() {
-        for entry in fs::read_dir(root)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() && (all || owned_marker(&entry.path())) {
-                names.insert(entry.file_name().to_string_lossy().into_owned());
-            }
-        }
-    }
-    if all {
-        names.extend(
-            profiles_from_ini(browser)?
-                .into_iter()
-                .map(|(name, _)| name),
-        );
-    }
-    Ok(names)
+    Ok(profiles_from_ini(browser)?
+        .into_iter()
+        .filter(|(name, path)| all || is_owned_profile(browser, name, path))
+        .map(|(name, _)| name)
+        .collect())
 }
 fn unregister_profile_locked(browser: Browser, name: &str, target: &Path) -> io::Result<()> {
     let ini = ini_path(browser);
@@ -1445,7 +1377,6 @@ fn create_with_id(
         Some(default) => default,
         None => prompt("Make default? [N|y] ")? == "y",
     };
-    reconcile_for(Some(browser))?;
     let _mutation_lock = MutationLock::acquire(browser)?;
     let _catalog_lock = CatalogLock::acquire()?;
     catalog_assignment_available(browser, &name, id)?;
@@ -1513,12 +1444,10 @@ fn launchable_profiles(browser: Option<Browser>) -> io::Result<Vec<CatalogEntry>
         .unwrap_or_else(|| vec![Browser::Firefox, Browser::Librewolf]);
     let mut choices = Vec::new();
     for browser in browsers {
-        let mut names = list_names(browser, false)?;
-        names.extend(
-            profiles_from_ini(browser)?
-                .into_iter()
-                .map(|(name, _)| name),
-        );
+        let names = profiles_from_ini(browser)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<BTreeSet<_>>();
         for name in names {
             if !valid_name(&name) {
                 continue;
@@ -1588,7 +1517,6 @@ fn run() -> io::Result<()> {
     let command = cli::parse(args)?;
     match command {
         Command::List { browser, all } => {
-            reconcile_for(browser)?;
             let _catalog_lock = CatalogLock::acquire()?;
             list_with_ids(browser, all)
         }
@@ -1604,7 +1532,6 @@ fn run() -> io::Result<()> {
                 Some(browser) => browser,
                 None => prompt_browser()?,
             };
-            reconcile_for(Some(browser))?;
             let _catalog_lock = CatalogLock::acquire()?;
             let (name, _) = default_profile(browser)?
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no default profile"))?;
@@ -1625,7 +1552,6 @@ fn run() -> io::Result<()> {
             if !confirm_target(&target, "Apply to")? {
                 return Ok(());
             }
-            reconcile_selector(browser, &selector)?;
             let (_mutation_lock, _catalog_lock) = lock_target(&target, Mutation::Apply)?;
             revalidate_selector(browser, selector, true, &target)?;
             read_catalog()?;
@@ -1639,7 +1565,6 @@ fn run() -> io::Result<()> {
             if !confirm_target(&target, "Set default for")? {
                 return Ok(());
             }
-            reconcile_selector(browser, &selector)?;
             let (_mutation_lock, _catalog_lock) = lock_target(&target, Mutation::Default)?;
             revalidate_selector(browser, selector, false, &target)?;
             read_catalog()?;
@@ -1658,7 +1583,6 @@ fn run() -> io::Result<()> {
             if !confirm_target(&target, "Remove")? {
                 return Ok(());
             }
-            reconcile_selector(browser, &selector)?;
             let (_mutation_lock, _catalog_lock) = lock_target(&target, mutation)?;
             revalidate_selector(browser, selector, false, &target)?;
             read_catalog()?;
@@ -1671,7 +1595,6 @@ fn run() -> io::Result<()> {
             args,
         } => {
             let browser = prompt_selector_browser(browser, &selector)?;
-            reconcile_selector(browser, &selector)?;
             let _catalog_lock = CatalogLock::acquire()?;
             let (browser, name) = resolve_selector(browser, selector, true)?;
             catalog_id(browser, &name, None)?;
@@ -1684,7 +1607,6 @@ fn run() -> io::Result<()> {
             args,
         } => {
             require_tty()?;
-            reconcile_for(browser)?;
             launch_from_picker(browser, private, &args)
         }
     }
